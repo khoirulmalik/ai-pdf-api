@@ -6,24 +6,49 @@ const {
   PutObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
-  ListObjectsV2Command,
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
+// DynamoDB SDK
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  PutCommand,
+  GetCommand,
+  DeleteCommand,
+  ScanCommand,
+  QueryCommand,
+} = require("@aws-sdk/lib-dynamodb");
+
 const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
 
-const fs = require("fs").promises;
 const path = require("path");
 require("dotenv").config();
 const cors = require("cors");
 const app = express();
 
 const PORT = process.env.PORT || 3000;
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:3001",
+  "http://localhost:3000",
+];
+
 const corsOptions = {
-  origin: "http://localhost:5173", // origin frontend kamu
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
 };
 
 app.use(cors(corsOptions));
@@ -39,26 +64,114 @@ const s3Client = new S3Client({
 
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
 
+// Konfigurasi DynamoDB
+const dynamoClient = new DynamoDBClient({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME || "pdf-documents";
+
 // Konfigurasi Google Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-// Database sederhana (JSON file)
-const DB_FILE = path.join(__dirname, "pdf-database.json");
 
-// Helper: Load database
-async function loadDatabase() {
+// ========== DynamoDB Helper Functions ==========
+
+// Helper: Simpan PDF record ke DynamoDB
+async function savePDFToDB(pdfRecord) {
   try {
-    const data = await fs.readFile(DB_FILE, "utf8");
-    return JSON.parse(data);
+    const command = new PutCommand({
+      TableName: TABLE_NAME,
+      Item: pdfRecord,
+    });
+    await docClient.send(command);
+    console.log("💾 Data berhasil disimpan ke DynamoDB");
+    return true;
   } catch (error) {
-    return { pdfs: [] };
+    console.error("❌ Error save to DynamoDB:", error.message);
+    throw error;
   }
 }
 
-// Helper: Save database
-async function saveDatabase(data) {
-  await fs.writeFile(DB_FILE, JSON.stringify(data, null, 2));
+// Helper: Ambil PDF record dari DynamoDB by ID
+async function getPDFFromDB(id) {
+  try {
+    const command = new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { id },
+    });
+    const response = await docClient.send(command);
+    return response.Item || null;
+  } catch (error) {
+    console.error("❌ Error get from DynamoDB:", error.message);
+    throw error;
+  }
 }
+
+// Helper: Hapus PDF record dari DynamoDB
+async function deletePDFFromDB(id) {
+  try {
+    const command = new DeleteCommand({
+      TableName: TABLE_NAME,
+      Key: { id },
+    });
+    await docClient.send(command);
+    console.log("💾 Data berhasil dihapus dari DynamoDB");
+    return true;
+  } catch (error) {
+    console.error("❌ Error delete from DynamoDB:", error.message);
+    throw error;
+  }
+}
+
+// Helper: Ambil semua PDF records dari DynamoDB
+async function getAllPDFsFromDB() {
+  try {
+    const command = new ScanCommand({
+      TableName: TABLE_NAME,
+    });
+    const response = await docClient.send(command);
+    return response.Items || [];
+  } catch (error) {
+    console.error("❌ Error scan DynamoDB:", error.message);
+    throw error;
+  }
+}
+
+// Helper: Search PDFs di DynamoDB (menggunakan Scan dengan filter)
+async function searchPDFsInDB(query) {
+  try {
+    const command = new ScanCommand({
+      TableName: TABLE_NAME,
+    });
+    const response = await docClient.send(command);
+    const allPDFs = response.Items || [];
+
+    // Filter di sisi aplikasi (karena DynamoDB tidak support full-text search)
+    const lowerQuery = query.toLowerCase();
+    return allPDFs.filter((pdf) => {
+      const searchText = `
+        ${pdf.originalName || ""} 
+        ${pdf.analysis?.title || ""} 
+        ${pdf.analysis?.summary || ""} 
+        ${pdf.analysis?.category || ""} 
+        ${pdf.analysis?.keywords?.join(" ") || ""}
+      `.toLowerCase();
+
+      return searchText.includes(lowerQuery);
+    });
+  } catch (error) {
+    console.error("❌ Error search DynamoDB:", error.message);
+    throw error;
+  }
+}
+
+// ========== PDF Processing Functions ==========
 
 // Helper: Extract text dari PDF menggunakan PDF.js
 async function extractTextFromPDF(pdfBuffer) {
@@ -70,7 +183,6 @@ async function extractTextFromPDF(pdfBuffer) {
     const numPages = pdfDocument.numPages;
     let fullText = "";
 
-    // Extract text dari setiap halaman
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const page = await pdfDocument.getPage(pageNum);
       const textContent = await page.getTextContent();
@@ -93,9 +205,8 @@ async function analyzePDFWithGemini(pdfBuffer, fileName) {
   try {
     console.log("🤖 Memulai analisis dengan Gemini AI...");
 
-    // Extract text dari PDF menggunakan PDF.js
     const { text, numPages } = await extractTextFromPDF(pdfBuffer);
-    const textContent = text.substring(0, 50000); // Limit 50k chars untuk efisiensi
+    const textContent = text.substring(0, 50000);
 
     console.log(`📄 Teks berhasil di-extract (${numPages} halaman)`);
 
@@ -119,7 +230,6 @@ Berikan HANYA JSON, tanpa markdown atau teks lain.`;
     const result = await model.generateContent(prompt);
     const response = result.response.text();
 
-    // Parse JSON dari response
     const jsonMatch = response.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error("Gagal parsing JSON dari Gemini");
@@ -135,7 +245,6 @@ Berikan HANYA JSON, tanpa markdown atau teks lain.`;
     };
   } catch (error) {
     console.error("❌ Error analisis Gemini:", error.message);
-    console.error("📋 Stack:", error.stack);
     return {
       title: fileName,
       summary: "Gagal menganalisis dokumen",
@@ -149,7 +258,8 @@ Berikan HANYA JSON, tanpa markdown atau teks lain.`;
   }
 }
 
-// Middleware untuk logging yang lebih detail
+// ========== Middleware ==========
+
 app.use((req, res, next) => {
   const timestamp = new Date().toLocaleString("id-ID");
   console.log("\n" + "=".repeat(60));
@@ -159,19 +269,16 @@ app.use((req, res, next) => {
   if (Object.keys(req.query).length > 0) {
     console.log(`🔍 Query:`, req.query);
   }
-  if (req.params && Object.keys(req.params).length > 0) {
-    console.log(`📝 Params:`, req.params);
-  }
   console.log("=".repeat(60));
   next();
 });
 
-// Konfigurasi Multer untuk handle upload file
+// Konfigurasi Multer
 const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // Limit 10MB
+    fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype === "application/pdf") {
@@ -184,7 +291,9 @@ const upload = multer({
 
 app.use(express.json());
 
-// Endpoint: Upload PDF ke S3
+// ========== API Endpoints ==========
+
+// Endpoint: Upload PDF ke S3 dan simpan ke DynamoDB
 app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
   try {
     console.log("📤 Memulai proses upload...");
@@ -203,6 +312,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
     const fileName = `${Date.now()}-${req.file.originalname}`;
     console.log(`🏷️  Nama file di S3: ${fileName}`);
 
+    // Upload ke S3
     const params = {
       Bucket: BUCKET_NAME,
       Key: fileName,
@@ -231,8 +341,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
       req.file.originalname
     );
 
-    // Simpan ke database
-    const db = await loadDatabase();
+    // Simpan ke DynamoDB
     const pdfRecord = {
       id: fileName,
       fileName: fileName,
@@ -244,9 +353,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
       analysis: analysis,
     };
 
-    db.pdfs.push(pdfRecord);
-    await saveDatabase(db);
-    console.log("💾 Data berhasil disimpan ke database");
+    await savePDFToDB(pdfRecord);
 
     const response = {
       success: true,
@@ -254,7 +361,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
       data: pdfRecord,
     };
 
-    console.log("✨ Response:", JSON.stringify(response, null, 2));
+    console.log("✨ Response berhasil dikirim");
     res.status(200).json(response);
   } catch (error) {
     console.error("❌ Error upload PDF:", error.message);
@@ -267,7 +374,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
   }
 });
 
-// Endpoint: Hapus PDF dari S3
+// Endpoint: Hapus PDF dari S3 dan DynamoDB
 app.delete("/api/pdf/delete/:fileName", async (req, res) => {
   try {
     const { fileName } = req.params;
@@ -281,6 +388,7 @@ app.delete("/api/pdf/delete/:fileName", async (req, res) => {
       });
     }
 
+    // Hapus dari S3
     const params = {
       Bucket: BUCKET_NAME,
       Key: fileName,
@@ -291,13 +399,8 @@ app.delete("/api/pdf/delete/:fileName", async (req, res) => {
     await s3Client.send(command);
     console.log("✅ File berhasil dihapus dari S3!");
 
-    // Hapus dari database
-    const db = await loadDatabase();
-    db.pdfs = db.pdfs.filter(
-      (p) => p.fileName !== fileName && p.id !== fileName
-    );
-    await saveDatabase(db);
-    console.log("💾 Data berhasil dihapus dari database");
+    // Hapus dari DynamoDB
+    await deletePDFFromDB(fileName);
 
     const response = {
       success: true,
@@ -308,7 +411,7 @@ app.delete("/api/pdf/delete/:fileName", async (req, res) => {
       },
     };
 
-    console.log("✨ Response:", JSON.stringify(response, null, 2));
+    console.log("✨ Response berhasil dikirim");
     res.status(200).json(response);
   } catch (error) {
     console.error("❌ Error hapus PDF:", error.message);
@@ -328,9 +431,6 @@ app.get("/api/pdf/url/:fileName", async (req, res) => {
     const expiresIn = parseInt(req.query.expires) || 3600;
 
     console.log(`🔗 Generate URL untuk: ${fileName}`);
-    console.log(
-      `⏱️  Expire dalam: ${expiresIn} detik (${expiresIn / 3600} jam)`
-    );
 
     const command = new GetObjectCommand({
       Bucket: BUCKET_NAME,
@@ -349,11 +449,9 @@ app.get("/api/pdf/url/:fileName", async (req, res) => {
       },
     };
 
-    console.log("✨ Response:", JSON.stringify(response, null, 2));
     res.status(200).json(response);
   } catch (error) {
     console.error("❌ Error generate URL:", error.message);
-    console.error("📋 Stack:", error.stack);
     res.status(500).json({
       success: false,
       message: "Gagal generate URL",
@@ -362,13 +460,12 @@ app.get("/api/pdf/url/:fileName", async (req, res) => {
   }
 });
 
-// Endpoint: List semua PDF di S3
+// Endpoint: List semua PDF dari DynamoDB
 app.get("/api/pdf/list", async (req, res) => {
   try {
-    console.log(`📋 Mengambil list PDF dari database...`);
+    console.log(`📋 Mengambil list PDF dari DynamoDB...`);
 
-    const db = await loadDatabase();
-    const files = db.pdfs;
+    const files = await getAllPDFsFromDB();
 
     console.log(`✅ Ditemukan ${files.length} file`);
 
@@ -380,14 +477,9 @@ app.get("/api/pdf/list", async (req, res) => {
       },
     };
 
-    console.log(
-      "✨ Response:",
-      JSON.stringify({ total: files.length }, null, 2)
-    );
     res.status(200).json(response);
   } catch (error) {
     console.error("❌ Error list PDF:", error.message);
-    console.error("📋 Stack:", error.stack);
     res.status(500).json({
       success: false,
       message: "Gagal mengambil list PDF",
@@ -402,8 +494,7 @@ app.get("/api/pdf/detail/:id", async (req, res) => {
     const { id } = req.params;
     console.log(`🔍 Mencari PDF dengan ID: ${id}`);
 
-    const db = await loadDatabase();
-    const pdf = db.pdfs.find((p) => p.id === id || p.fileName === id);
+    const pdf = await getPDFFromDB(id);
 
     if (!pdf) {
       return res.status(404).json({
@@ -442,18 +533,7 @@ app.get("/api/pdf/search", async (req, res) => {
     const query = req.query.q?.toLowerCase() || "";
     console.log(`🔍 Mencari PDF dengan query: "${query}"`);
 
-    const db = await loadDatabase();
-    const results = db.pdfs.filter((pdf) => {
-      const searchText = `
-        ${pdf.originalName} 
-        ${pdf.analysis?.title || ""} 
-        ${pdf.analysis?.summary || ""} 
-        ${pdf.analysis?.category || ""} 
-        ${pdf.analysis?.keywords?.join(" ") || ""}
-      `.toLowerCase();
-
-      return searchText.includes(query);
-    });
+    const results = await searchPDFsInDB(query);
 
     console.log(`✅ Ditemukan ${results.length} hasil`);
 
@@ -491,9 +571,8 @@ app.post("/api/pdf/chat/:id", express.json(), async (req, res) => {
       });
     }
 
-    // Ambil PDF dari database
-    const db = await loadDatabase();
-    const pdf = db.pdfs.find((p) => p.id === id || p.fileName === id);
+    // Ambil PDF dari DynamoDB
+    const pdf = await getPDFFromDB(id);
 
     if (!pdf) {
       return res.status(404).json({
@@ -512,10 +591,10 @@ app.post("/api/pdf/chat/:id", express.json(), async (req, res) => {
     const s3Response = await s3Client.send(getCommand);
     const pdfBuffer = Buffer.from(await s3Response.Body.transformToByteArray());
 
-    // Extract text dari PDF menggunakan PDF.js
+    // Extract text dari PDF
     console.log("📖 Mengekstrak text dari PDF...");
     const { text } = await extractTextFromPDF(pdfBuffer);
-    const textContent = text.substring(0, 100000); // Limit 100k chars
+    const textContent = text.substring(0, 100000);
 
     // Tanya ke Gemini
     console.log("🤖 Mengirim pertanyaan ke Gemini AI...");
@@ -553,7 +632,6 @@ Jawab pertanyaan dengan jelas dan informatif berdasarkan konten dokumen di atas.
     });
   } catch (error) {
     console.error("❌ Error chat:", error.message);
-    console.error("📋 Stack:", error.stack);
     res.status(500).json({
       success: false,
       message: "Gagal memproses chat",
@@ -562,7 +640,7 @@ Jawab pertanyaan dengan jelas dan informatif berdasarkan konten dokumen di atas.
   }
 });
 
-// Endpoint: Chat umum dengan AI (tanpa PDF spesifik)
+// Endpoint: Chat umum dengan AI
 app.post("/api/ai/chat", express.json(), async (req, res) => {
   try {
     const { message } = req.body;
@@ -601,7 +679,7 @@ app.post("/api/ai/chat", express.json(), async (req, res) => {
   }
 });
 
-// Endpoint: Tanya AI tentang semua PDF (RAG sederhana)
+// Endpoint: Tanya AI tentang semua PDF
 app.post("/api/ai/ask-all", express.json(), async (req, res) => {
   try {
     const { question } = req.body;
@@ -615,10 +693,10 @@ app.post("/api/ai/ask-all", express.json(), async (req, res) => {
       });
     }
 
-    // Ambil semua PDF
-    const db = await loadDatabase();
+    // Ambil semua PDF dari DynamoDB
+    const pdfs = await getAllPDFsFromDB();
 
-    if (db.pdfs.length === 0) {
+    if (pdfs.length === 0) {
       return res.status(404).json({
         success: false,
         message: "Belum ada PDF yang diupload",
@@ -626,7 +704,7 @@ app.post("/api/ai/ask-all", express.json(), async (req, res) => {
     }
 
     // Compile informasi dari semua PDF
-    const allPdfInfo = db.pdfs
+    const allPdfInfo = pdfs
       .map(
         (pdf) => `
 Dokumen: ${pdf.originalName}
@@ -640,12 +718,12 @@ Topik: ${pdf.analysis?.mainTopics?.join(", ") || "N/A"}
       )
       .join("\n");
 
-    console.log(`📚 Menganalisis ${db.pdfs.length} dokumen...`);
+    console.log(`📚 Menganalisis ${pdfs.length} dokumen...`);
 
     const prompt = `
 Kamu adalah asisten AI yang membantu mencari informasi dari kumpulan dokumen PDF.
 
-Berikut adalah ringkasan dari ${db.pdfs.length} dokumen yang tersedia:
+Berikut adalah ringkasan dari ${pdfs.length} dokumen yang tersedia:
 
 ${allPdfInfo}
 
@@ -665,7 +743,7 @@ Jawab pertanyaan berdasarkan informasi dokumen di atas. Jika perlu, sebutkan dok
       data: {
         question: question,
         answer: answer,
-        analyzedDocuments: db.pdfs.length,
+        analyzedDocuments: pdfs.length,
         timestamp: new Date().toISOString(),
       },
     });
@@ -679,7 +757,7 @@ Jawab pertanyaan berdasarkan informasi dokumen di atas. Jika perlu, sebutkan dok
   }
 });
 
-// Error handler untuk Multer
+// Error handler
 app.use((error, req, res, next) => {
   console.error("❌ Error caught:", error.message);
 
@@ -693,8 +771,7 @@ app.use((error, req, res, next) => {
     if (error.code === "UNEXPECTED_FIELD") {
       return res.status(400).json({
         success: false,
-        message:
-          'Field name harus "pdf". Pastikan di Postman form-data key-nya adalah "pdf" (huruf kecil) dan type-nya File',
+        message: 'Field name harus "pdf"',
         receivedField: error.field,
       });
     }
@@ -715,7 +792,12 @@ app.use((error, req, res, next) => {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "OK", message: "Server is running" });
+  res.status(200).json({
+    status: "OK",
+    message: "Server is running",
+    database: "DynamoDB",
+    table: TABLE_NAME,
+  });
 });
 
 app.listen(PORT, () => {
@@ -726,6 +808,7 @@ app.listen(PORT, () => {
   console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
   console.log(`☁️  AWS Region: ${process.env.AWS_REGION}`);
   console.log(`🪣 S3 Bucket: ${BUCKET_NAME}`);
+  console.log(`🗄️  DynamoDB Table: ${TABLE_NAME}`);
   console.log(
     `🤖 AI: Google Gemini ${process.env.GEMINI_API_KEY ? "✅" : "❌"}`
   );
