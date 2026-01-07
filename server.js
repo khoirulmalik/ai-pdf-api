@@ -1,6 +1,7 @@
-// server.js
+// server.js (Updated - AI processing di Lambda)
 const express = require("express");
 const multer = require("multer");
+const axios = require("axios");
 const {
   S3Client,
   PutObjectCommand,
@@ -8,7 +9,6 @@ const {
   GetObjectCommand,
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // DynamoDB SDK
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
@@ -18,10 +18,7 @@ const {
   GetCommand,
   DeleteCommand,
   ScanCommand,
-  QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
-
-const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
 
 const path = require("path");
 require("dotenv").config();
@@ -29,6 +26,10 @@ const cors = require("cors");
 const app = express();
 
 const PORT = process.env.PORT || 3000;
+
+// Lambda API Gateway URL
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL; // Dari API Gateway
+
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3001",
@@ -37,9 +38,7 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
-
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
@@ -76,13 +75,8 @@ const dynamoClient = new DynamoDBClient({
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME || "pdf-documents";
 
-// Konfigurasi Google Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-
 // ========== DynamoDB Helper Functions ==========
 
-// Helper: Simpan PDF record ke DynamoDB
 async function savePDFToDB(pdfRecord) {
   try {
     const command = new PutCommand({
@@ -98,7 +92,6 @@ async function savePDFToDB(pdfRecord) {
   }
 }
 
-// Helper: Ambil PDF record dari DynamoDB by ID
 async function getPDFFromDB(id) {
   try {
     const command = new GetCommand({
@@ -113,7 +106,6 @@ async function getPDFFromDB(id) {
   }
 }
 
-// Helper: Hapus PDF record dari DynamoDB
 async function deletePDFFromDB(id) {
   try {
     const command = new DeleteCommand({
@@ -129,7 +121,6 @@ async function deletePDFFromDB(id) {
   }
 }
 
-// Helper: Ambil semua PDF records dari DynamoDB
 async function getAllPDFsFromDB() {
   try {
     const command = new ScanCommand({
@@ -143,7 +134,6 @@ async function getAllPDFsFromDB() {
   }
 }
 
-// Helper: Search PDFs di DynamoDB (menggunakan Scan dengan filter)
 async function searchPDFsInDB(query) {
   try {
     const command = new ScanCommand({
@@ -152,7 +142,6 @@ async function searchPDFsInDB(query) {
     const response = await docClient.send(command);
     const allPDFs = response.Items || [];
 
-    // Filter di sisi aplikasi (karena DynamoDB tidak support full-text search)
     const lowerQuery = query.toLowerCase();
     return allPDFs.filter((pdf) => {
       const searchText = `
@@ -171,90 +160,91 @@ async function searchPDFsInDB(query) {
   }
 }
 
-// ========== PDF Processing Functions ==========
+// ========== Lambda Helper Functions ==========
 
-// Helper: Extract text dari PDF menggunakan PDF.js
-async function extractTextFromPDF(pdfBuffer) {
+// Call Lambda untuk analisis PDF
+async function callLambdaAnalyzePDF(fileName, originalName) {
   try {
-    const uint8Array = new Uint8Array(pdfBuffer);
-    const loadingTask = pdfjsLib.getDocument({ data: uint8Array });
-    const pdfDocument = await loadingTask.promise;
-
-    const numPages = pdfDocument.numPages;
-    let fullText = "";
-
-    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-      const page = await pdfDocument.getPage(pageNum);
-      const textContent = await page.getTextContent();
-      const pageText = textContent.items.map((item) => item.str).join(" ");
-      fullText += pageText + "\n";
-    }
-
-    return {
-      text: fullText,
-      numPages: numPages,
-    };
+    console.log("🚀 Calling Lambda for PDF analysis...");
+    const response = await axios.post(
+      `${LAMBDA_API_URL}/analyze-pdf`,
+      {
+        fileName: fileName,
+        originalName: originalName,
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 300000, // 5 minutes
+      }
+    );
+    return response.data;
   } catch (error) {
-    console.error("❌ Error extract PDF:", error.message);
+    console.error("❌ Error calling Lambda:", error.message);
     throw error;
   }
 }
 
-// Helper: Analisis PDF dengan Gemini
-async function analyzePDFWithGemini(pdfBuffer, fileName) {
+// Call Lambda untuk chat dengan PDF
+async function callLambdaChatPDF(id, question) {
   try {
-    console.log("🤖 Memulai analisis dengan Gemini AI...");
-
-    const { text, numPages } = await extractTextFromPDF(pdfBuffer);
-    const textContent = text.substring(0, 50000);
-
-    console.log(`📄 Teks berhasil di-extract (${numPages} halaman)`);
-
-    const prompt = `
-Analisis dokumen PDF berikut dan berikan informasi dalam format JSON:
-
-{
-  "title": "judul dokumen (jika tidak ada, buat berdasarkan konten)",
-  "summary": "ringkasan 2-3 kalimat",
-  "category": "kategori dokumen (misal: Akademik, Bisnis, Teknis, dll)",
-  "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "language": "bahasa dokumen",
-  "mainTopics": ["topik utama 1", "topik utama 2", "topik utama 3"]
+    console.log("🚀 Calling Lambda for chat...");
+    const response = await axios.post(
+      `${LAMBDA_API_URL}/chat-pdf`,
+      {
+        id: id,
+        question: question,
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 300000,
+      }
+    );
+    return response.data;
+  } catch (error) {
+    console.error("❌ Error calling Lambda:", error.message);
+    throw error;
+  }
 }
 
-Konten dokumen:
-${textContent}
-
-Berikan HANYA JSON, tanpa markdown atau teks lain.`;
-
-    const result = await model.generateContent(prompt);
-    const response = result.response.text();
-
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("Gagal parsing JSON dari Gemini");
-    }
-
-    const analysis = JSON.parse(jsonMatch[0]);
-    console.log("✅ Analisis selesai!");
-
-    return {
-      ...analysis,
-      pageCount: numPages,
-      analyzedAt: new Date().toISOString(),
-    };
+// Call Lambda untuk chat umum
+async function callLambdaAIChat(message) {
+  try {
+    console.log("🚀 Calling Lambda for general chat...");
+    const response = await axios.post(
+      `${LAMBDA_API_URL}/ai-chat`,
+      {
+        message: message,
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 300000,
+      }
+    );
+    return response.data;
   } catch (error) {
-    console.error("❌ Error analisis Gemini:", error.message);
-    return {
-      title: fileName,
-      summary: "Gagal menganalisis dokumen",
-      category: "Unknown",
-      keywords: [],
-      language: "Unknown",
-      mainTopics: [],
-      pageCount: 0,
-      error: error.message,
-    };
+    console.error("❌ Error calling Lambda:", error.message);
+    throw error;
+  }
+}
+
+// Call Lambda untuk tanya semua PDF
+async function callLambdaAskAll(question) {
+  try {
+    console.log("🚀 Calling Lambda for ask all...");
+    const response = await axios.post(
+      `${LAMBDA_API_URL}/ask-all`,
+      {
+        question: question,
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 300000,
+      }
+    );
+    return response.data;
+  } catch (error) {
+    console.error("❌ Error calling Lambda:", error.message);
+    throw error;
   }
 }
 
@@ -264,8 +254,8 @@ app.use((req, res, next) => {
   const timestamp = new Date().toLocaleString("id-ID");
   console.log("\n" + "=".repeat(60));
   console.log(`⏰ ${timestamp}`);
-  console.log(`📍 ${req.method} ${req.url}`);
-  console.log(`🌐 IP: ${req.ip}`);
+  console.log(`📝 ${req.method} ${req.url}`);
+  console.log(`🌍 IP: ${req.ip}`);
   if (Object.keys(req.query).length > 0) {
     console.log(`🔍 Query:`, req.query);
   }
@@ -293,7 +283,7 @@ app.use(express.json());
 
 // ========== API Endpoints ==========
 
-// Endpoint: Upload PDF ke S3 dan simpan ke DynamoDB
+// Endpoint: Upload PDF ke S3 dan analisis dengan Lambda
 app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
   try {
     console.log("📤 Memulai proses upload...");
@@ -310,7 +300,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
     console.log(`📦 Ukuran: ${(req.file.size / 1024).toFixed(2)} KB`);
 
     const fileName = `${Date.now()}-${req.file.originalname}`;
-    console.log(`🏷️  Nama file di S3: ${fileName}`);
+    console.log(`🏷️ Nama file di S3: ${fileName}`);
 
     // Upload ke S3
     const params = {
@@ -320,7 +310,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
       ContentType: "application/pdf",
     };
 
-    console.log("☁️  Mengupload ke S3...");
+    console.log("☁️ Mengupload ke S3...");
     const command = new PutObjectCommand(params);
     await s3Client.send(command);
     console.log("✅ Upload ke S3 berhasil!");
@@ -335,11 +325,24 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
     });
     console.log("🔗 Signed URL berhasil di-generate");
 
-    // Analisis PDF dengan Gemini
-    const analysis = await analyzePDFWithGemini(
-      req.file.buffer,
+    // Analisis PDF dengan Lambda
+    console.log("🤖 Mengirim ke Lambda untuk analisis...");
+    const lambdaResponse = await callLambdaAnalyzePDF(
+      fileName,
       req.file.originalname
     );
+
+    const analysis = lambdaResponse.success
+      ? lambdaResponse.data
+      : {
+          title: req.file.originalname,
+          summary: "Gagal menganalisis dokumen",
+          category: "Unknown",
+          keywords: [],
+          language: "Unknown",
+          mainTopics: [],
+          pageCount: 0,
+        };
 
     // Simpan ke DynamoDB
     const pdfRecord = {
@@ -378,7 +381,7 @@ app.post("/api/pdf/upload", upload.single("pdf"), async (req, res) => {
 app.delete("/api/pdf/delete/:fileName", async (req, res) => {
   try {
     const { fileName } = req.params;
-    console.log(`🗑️  Memulai proses hapus file: ${fileName}`);
+    console.log(`🗑️ Memulai proses hapus file: ${fileName}`);
 
     if (!fileName) {
       console.log("❌ Nama file kosong");
@@ -394,7 +397,7 @@ app.delete("/api/pdf/delete/:fileName", async (req, res) => {
       Key: fileName,
     };
 
-    console.log("☁️  Menghapus dari S3...");
+    console.log("☁️ Menghapus dari S3...");
     const command = new DeleteObjectCommand(params);
     await s3Client.send(command);
     console.log("✅ File berhasil dihapus dari S3!");
@@ -555,7 +558,7 @@ app.get("/api/pdf/search", async (req, res) => {
   }
 });
 
-// Endpoint: Chat dengan AI tentang PDF tertentu
+// Endpoint: Chat dengan AI tentang PDF tertentu (via Lambda)
 app.post("/api/pdf/chat/:id", express.json(), async (req, res) => {
   try {
     const { id } = req.params;
@@ -571,65 +574,10 @@ app.post("/api/pdf/chat/:id", express.json(), async (req, res) => {
       });
     }
 
-    // Ambil PDF dari DynamoDB
-    const pdf = await getPDFFromDB(id);
+    // Call Lambda
+    const lambdaResponse = await callLambdaChatPDF(id, question);
 
-    if (!pdf) {
-      return res.status(404).json({
-        success: false,
-        message: "PDF tidak ditemukan",
-      });
-    }
-
-    console.log(`📄 PDF ditemukan: ${pdf.originalName}`);
-
-    // Download PDF dari S3
-    const getCommand = new GetObjectCommand({
-      Bucket: BUCKET_NAME,
-      Key: pdf.fileName,
-    });
-    const s3Response = await s3Client.send(getCommand);
-    const pdfBuffer = Buffer.from(await s3Response.Body.transformToByteArray());
-
-    // Extract text dari PDF
-    console.log("📖 Mengekstrak text dari PDF...");
-    const { text } = await extractTextFromPDF(pdfBuffer);
-    const textContent = text.substring(0, 100000);
-
-    // Tanya ke Gemini
-    console.log("🤖 Mengirim pertanyaan ke Gemini AI...");
-    const prompt = `
-Kamu adalah asisten AI yang membantu menjawab pertanyaan tentang dokumen PDF.
-
-Informasi dokumen:
-- Judul: ${pdf.analysis?.title || pdf.originalName}
-- Kategori: ${pdf.analysis?.category || "Unknown"}
-- Ringkasan: ${pdf.analysis?.summary || "Tidak ada ringkasan"}
-- Topik utama: ${pdf.analysis?.mainTopics?.join(", ") || "Tidak ada"}
-
-Konten dokumen:
-${textContent}
-
-Pertanyaan pengguna: ${question}
-
-Jawab pertanyaan dengan jelas dan informatif berdasarkan konten dokumen di atas. Jika informasi tidak ada di dokumen, katakan dengan jujur.
-`;
-
-    const result = await model.generateContent(prompt);
-    const answer = result.response.text();
-
-    console.log("✅ Jawaban berhasil di-generate!");
-
-    res.status(200).json({
-      success: true,
-      data: {
-        pdfId: pdf.id,
-        pdfTitle: pdf.analysis?.title || pdf.originalName,
-        question: question,
-        answer: answer,
-        timestamp: new Date().toISOString(),
-      },
-    });
+    res.status(200).json(lambdaResponse);
   } catch (error) {
     console.error("❌ Error chat:", error.message);
     res.status(500).json({
@@ -640,7 +588,7 @@ Jawab pertanyaan dengan jelas dan informatif berdasarkan konten dokumen di atas.
   }
 });
 
-// Endpoint: Chat umum dengan AI
+// Endpoint: Chat umum dengan AI (via Lambda)
 app.post("/api/ai/chat", express.json(), async (req, res) => {
   try {
     const { message } = req.body;
@@ -655,20 +603,10 @@ app.post("/api/ai/chat", express.json(), async (req, res) => {
       });
     }
 
-    console.log("🤖 Mengirim ke Gemini AI...");
-    const result = await model.generateContent(message);
-    const response = result.response.text();
+    // Call Lambda
+    const lambdaResponse = await callLambdaAIChat(message);
 
-    console.log("✅ Response berhasil!");
-
-    res.status(200).json({
-      success: true,
-      data: {
-        message: message,
-        response: response,
-        timestamp: new Date().toISOString(),
-      },
-    });
+    res.status(200).json(lambdaResponse);
   } catch (error) {
     console.error("❌ Error AI chat:", error.message);
     res.status(500).json({
@@ -679,12 +617,12 @@ app.post("/api/ai/chat", express.json(), async (req, res) => {
   }
 });
 
-// Endpoint: Tanya AI tentang semua PDF
+// Endpoint: Tanya AI tentang semua PDF (via Lambda)
 app.post("/api/ai/ask-all", express.json(), async (req, res) => {
   try {
     const { question } = req.body;
 
-    console.log(`🔍 Pertanyaan tentang semua PDF: ${question}`);
+    console.log(`📚 Pertanyaan tentang semua PDF: ${question}`);
 
     if (!question) {
       return res.status(400).json({
@@ -693,60 +631,10 @@ app.post("/api/ai/ask-all", express.json(), async (req, res) => {
       });
     }
 
-    // Ambil semua PDF dari DynamoDB
-    const pdfs = await getAllPDFsFromDB();
+    // Call Lambda
+    const lambdaResponse = await callLambdaAskAll(question);
 
-    if (pdfs.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Belum ada PDF yang diupload",
-      });
-    }
-
-    // Compile informasi dari semua PDF
-    const allPdfInfo = pdfs
-      .map(
-        (pdf) => `
-Dokumen: ${pdf.originalName}
-Judul: ${pdf.analysis?.title || "N/A"}
-Kategori: ${pdf.analysis?.category || "N/A"}
-Ringkasan: ${pdf.analysis?.summary || "N/A"}
-Keywords: ${pdf.analysis?.keywords?.join(", ") || "N/A"}
-Topik: ${pdf.analysis?.mainTopics?.join(", ") || "N/A"}
----
-`
-      )
-      .join("\n");
-
-    console.log(`📚 Menganalisis ${pdfs.length} dokumen...`);
-
-    const prompt = `
-Kamu adalah asisten AI yang membantu mencari informasi dari kumpulan dokumen PDF.
-
-Berikut adalah ringkasan dari ${pdfs.length} dokumen yang tersedia:
-
-${allPdfInfo}
-
-Pertanyaan pengguna: ${question}
-
-Jawab pertanyaan berdasarkan informasi dokumen di atas. Jika perlu, sebutkan dokumen mana yang relevan. Jika informasi tidak cukup, katakan dengan jelas.
-`;
-
-    console.log("🤖 Mengirim ke Gemini AI...");
-    const result = await model.generateContent(prompt);
-    const answer = result.response.text();
-
-    console.log("✅ Jawaban berhasil!");
-
-    res.status(200).json({
-      success: true,
-      data: {
-        question: question,
-        answer: answer,
-        analyzedDocuments: pdfs.length,
-        timestamp: new Date().toISOString(),
-      },
-    });
+    res.status(200).json(lambdaResponse);
   } catch (error) {
     console.error("❌ Error ask-all:", error.message);
     res.status(500).json({
@@ -797,6 +685,7 @@ app.get("/health", (req, res) => {
     message: "Server is running",
     database: "DynamoDB",
     table: TABLE_NAME,
+    lambdaAPI: LAMBDA_API_URL,
   });
 });
 
@@ -806,12 +695,10 @@ app.listen(PORT, () => {
   console.log("=".repeat(60));
   console.log(`📍 Port: ${PORT}`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
-  console.log(`☁️  AWS Region: ${process.env.AWS_REGION}`);
+  console.log(`☁️ AWS Region: ${process.env.AWS_REGION}`);
   console.log(`🪣 S3 Bucket: ${BUCKET_NAME}`);
-  console.log(`🗄️  DynamoDB Table: ${TABLE_NAME}`);
-  console.log(
-    `🤖 AI: Google Gemini ${process.env.GEMINI_API_KEY ? "✅" : "❌"}`
-  );
+  console.log(`🗄️ DynamoDB Table: ${TABLE_NAME}`);
+  console.log(`⚡ Lambda API: ${LAMBDA_API_URL || "❌ Not configured"}`);
   console.log("=".repeat(60));
   console.log("📡 PDF Management Endpoints:");
   console.log(`   ✅ Health Check:  http://localhost:${PORT}/health`);
@@ -827,10 +714,10 @@ app.listen(PORT, () => {
     `   🔗 Get URL:       http://localhost:${PORT}/api/pdf/url/:fileName`
   );
   console.log(
-    `   🗑️  Delete PDF:    http://localhost:${PORT}/api/pdf/delete/:fileName`
+    `   🗑️ Delete PDF:    http://localhost:${PORT}/api/pdf/delete/:fileName`
   );
   console.log("");
-  console.log("🤖 AI Chat Endpoints:");
+  console.log("🤖 AI Chat Endpoints (via Lambda):");
   console.log(`   💬 Chat PDF:      http://localhost:${PORT}/api/pdf/chat/:id`);
   console.log(`   💭 Chat Umum:     http://localhost:${PORT}/api/ai/chat`);
   console.log(`   📚 Tanya Semua:   http://localhost:${PORT}/api/ai/ask-all`);

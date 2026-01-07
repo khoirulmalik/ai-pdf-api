@@ -17,6 +17,7 @@
     "@aws-sdk/lib-dynamodb": "^3.936.0",
     "@aws-sdk/s3-request-presigner": "^3.932.0",
     "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
